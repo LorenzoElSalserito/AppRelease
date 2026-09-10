@@ -6,7 +6,16 @@
 # Inputs (environment variables):
 #   ASSETS_DIR   Directory containing the downloaded release assets. Default: assets
 #   SITE_DIR     Output directory for the static site.            Default: _site
-#   BASE_URL     Public base URL of the site, no trailing slash.  Required.
+#   BASE_URL     Public base URL of the landing site (GitHub Pages),
+#                no trailing slash.                                Required.
+#   RELEASES_BASE_URL  Base URL of the GitHub release downloads, e.g.
+#                https://github.com/owner/repo/releases/download. When set, the
+#                assets that are not .deb/.rpm are linked there instead of being
+#                copied into the repository: they are not part of the APT/DNF
+#                indexes, so duplicating them only burns storage.
+#   PKG_BASE_URL Public base URL of the package storage (Cloudflare R2),
+#                no trailing slash. Defaults to BASE_URL, i.e. everything is
+#                served from a single host.
 #   GPG_KEY_ID   Fingerprint or key id used for signing.          Required.
 #   GPG_PASSPHRASE_FILE  Optional file holding the key passphrase.
 #   REPO_NAME    Human readable repository name.                  Default: AppRelease
@@ -24,6 +33,11 @@ APT_COMPONENT="${APT_COMPONENT:-main}"
 : "${GPG_KEY_ID:?GPG_KEY_ID must be set}"
 
 BASE_URL="${BASE_URL%/}"
+# Package payloads can live on a different host from the landing page: GitHub
+# Pages caps a published site at 1 GB, which a repository of desktop
+# applications blows through immediately.
+PKG_BASE_URL="${PKG_BASE_URL:-$BASE_URL}"
+PKG_BASE_URL="${PKG_BASE_URL%/}"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
@@ -110,16 +124,23 @@ for f in "$ASSETS_DIR"/**/*.rpm "$ASSETS_DIR"/*.rpm; do
   rpm_count=$((rpm_count + 1))
 done
 
-# Everything else (AppImage, tarballs, checksums, ...) is published verbatim,
-# preserving the release tag it came from.
+# Everything else (AppImage, tarballs, checksums, ...) is not indexed by APT or
+# DNF, so there is nothing to gain from re-hosting it. With RELEASES_BASE_URL
+# set we only record name and size and link straight back to the GitHub release;
+# without it, we fall back to publishing a copy.
 other_count=0
+other_manifest="$SITE_DIR/.other-assets.tsv"
+: > "$other_manifest"
 while IFS= read -r -d '' f; do
   rel="${f#"$ASSETS_DIR"/}"
   case "${rel,,}" in
     *.deb|*.rpm) continue ;;
   esac
-  mkdir -p "$SITE_DIR/files/$(dirname "$rel")"
-  cp -f "$f" "$SITE_DIR/files/$rel"
+  printf '%s\t%s\n' "$rel" "$(stat -c %s "$f")" >> "$other_manifest"
+  if [[ -z "${RELEASES_BASE_URL:-}" ]]; then
+    mkdir -p "$SITE_DIR/files/$(dirname "$rel")"
+    cp -f "$f" "$SITE_DIR/files/$rel"
+  fi
   other_count=$((other_count + 1))
 done < <(find "$ASSETS_DIR" -type f -print0 2>/dev/null || true)
 
@@ -268,7 +289,7 @@ log "Writing client configuration files"
 # deb822 sources file (Debian 12+/Ubuntu 22.04+ and any modern APT).
 cat > "$SITE_DIR/apprelease.sources" <<EOF
 Types: deb
-URIs: $BASE_URL/deb
+URIs: $PKG_BASE_URL/deb
 Suites: $APT_SUITE
 Components: $APT_COMPONENT
 Signed-By: /etc/apt/keyrings/$REPO_NAME.asc
@@ -276,13 +297,13 @@ EOF
 
 # One-line legacy format, for older APT.
 cat > "$SITE_DIR/apprelease.list" <<EOF
-deb [signed-by=/etc/apt/keyrings/$REPO_NAME.asc] $BASE_URL/deb $APT_SUITE $APT_COMPONENT
+deb [signed-by=/etc/apt/keyrings/$REPO_NAME.asc] $PKG_BASE_URL/deb $APT_SUITE $APT_COMPONENT
 EOF
 
 cat > "$SITE_DIR/apprelease.repo" <<EOF
 [$REPO_NAME]
 name=$REPO_NAME
-baseurl=$BASE_URL/rpm
+baseurl=$PKG_BASE_URL/rpm
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
@@ -297,10 +318,11 @@ KEY_FPR="$(gpg --batch --with-colons --fingerprint "$GPG_KEY_ID" 2>/dev/null \
 BUILT_AT="$(date -u '+%Y-%m-%d %H:%M UTC')"
 
 python3 - "$SITE_DIR" "$BASE_URL" "$REPO_NAME" "$APT_SUITE" "$APT_COMPONENT" \
-         "${KEY_FPR:-unknown}" "$BUILT_AT" <<'PY'
-import html, os, sys
+         "${KEY_FPR:-unknown}" "$BUILT_AT" "$PKG_BASE_URL" \
+         "${RELEASES_BASE_URL:-}" <<'PY'
+import html, os, sys, urllib.parse
 
-site, base, name, suite, component, fpr, built = sys.argv[1:8]
+site, base, name, suite, component, fpr, built, pkgbase, relbase = sys.argv[1:10]
 
 def listing(subdir, exts):
     root = os.path.join(site, subdir)
@@ -325,7 +347,7 @@ def table(rows):
     if not rows:
         return "<p class='empty'>Nessun file pubblicato.</p>"
     body = "\n".join(
-        f"<tr><td><a href='{html.escape(rel)}'>{html.escape(fn)}</a></td>"
+        f"<tr><td><a href='{html.escape(rel if rel.startswith('http') else pkgbase + '/' + rel)}'>{html.escape(fn)}</a></td>"
         f"<td class='num'>{human(size)}</td></tr>"
         for rel, fn, size in rows
     )
@@ -333,7 +355,19 @@ def table(rows):
 
 debs = listing("deb/pool", (".deb",))
 rpms = listing("rpm", (".rpm",))
-others = listing("files", None)
+manifest = os.path.join(site, ".other-assets.tsv")
+if relbase and os.path.exists(manifest):
+    others = []
+    with open(manifest, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            rel, size = line.rstrip("\n").split("\t")
+            url = relbase.rstrip("/") + "/" + urllib.parse.quote(rel)
+            others.append((url, os.path.basename(rel), int(size)))
+    others.sort(key=lambda r: r[1])
+else:
+    others = listing("files", None)
 
 fpr_pretty = " ".join(fpr[i:i+4] for i in range(0, len(fpr), 4)) if fpr != "unknown" else fpr
 
@@ -364,6 +398,7 @@ page = f"""<!doctype html>
   .num {{ text-align:right; white-space:nowrap; color:var(--mut); }}
   a {{ color:var(--acc); }}
   .empty {{ color:var(--mut); font-style:italic; }}
+  .note {{ color:var(--mut); font-size:.85rem; margin:-.25rem 0 .75rem; }}
   footer {{ margin-top:3rem; color:var(--mut); font-size:.82rem; border-top:1px solid var(--bd); padding-top:1rem; }}
 </style>
 </head>
@@ -385,7 +420,7 @@ sudo dnf makecache</code></pre>
 
   <h2>openSUSE (zypper)</h2>
 <pre><code>sudo rpm --import {base}/public-key.asc
-sudo zypper addrepo --gpgcheck --refresh {base}/rpm {name}
+sudo zypper addrepo --gpgcheck --refresh {pkgbase}/rpm {name}
 sudo zypper refresh</code></pre>
 
   <h2>Pacchetti .deb</h2>
@@ -394,7 +429,7 @@ sudo zypper refresh</code></pre>
   <h2>Pacchetti .rpm</h2>
   {table(rpms)}
 
-  <h2>Altri file (AppImage, archivi, checksum)</h2>
+  <h2>Altri file (AppImage, archivi, checksum)</h2>\n  <p class="note">Non fanno parte degli indici APT/DNF: si scaricano a mano e non si aggiornano da soli.</p>
   {table(others)}
 
   <footer>
@@ -414,6 +449,7 @@ with open(os.path.join(site, "index.html"), "w", encoding="utf-8") as fh:
 PY
 
 # Prevent Jekyll from stripping directories that begin with an underscore.
+rm -f "$other_manifest"
 touch "$SITE_DIR/.nojekyll"
 
 log "Site ready in $SITE_DIR"

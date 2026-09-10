@@ -37,7 +37,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dpkg-dev apt-utils createrepo-c rpm gnupg xz-utils
+            dpkg-dev apt-utils createrepo-c rpm gnupg xz-utils rclone
 
       - name: Download assets from every published release
         env:
@@ -113,6 +113,25 @@ jobs:
             echo "GPG_PASSPHRASE_FILE=$pass_file"
           } >> "$GITHUB_ENV"
 
+      - name: Check package storage configuration
+        env:
+          PKG_BASE_URL: ${{ vars.PKG_BASE_URL }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in PKG_BASE_URL R2_BUCKET R2_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+            [ -n "${!v:-}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing package storage configuration:$missing — see manual_operations.md §8c."
+            exit 1
+          fi
+          echo "Package storage: $PKG_BASE_URL (bucket $R2_BUCKET)"
+
       - name: Compute public base URL
         id: site
         env:
@@ -144,6 +163,8 @@ jobs:
           ASSETS_DIR: assets
           SITE_DIR: _site
           BASE_URL: ${{ steps.site.outputs.url }}
+          PKG_BASE_URL: ${{ vars.PKG_BASE_URL }}
+          RELEASES_BASE_URL: https://github.com/${{ github.repository }}/releases/download
           REPO_NAME: ${{ steps.site.outputs.name }}
           APT_SUITE: stable
           APT_COMPONENT: main
@@ -169,6 +190,65 @@ jobs:
             done
             echo "RPM signatures: OK"
           fi
+
+      - name: Publish packages to Cloudflare R2
+        env:
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          # rclone reads its whole configuration from these variables, so no
+          # credentials are ever written to a config file on the runner.
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ACL: private
+          RCLONE_S3_NO_CHECK_BUCKET: "true"
+        run: |
+          set -euo pipefail
+
+          # `--checksum` compares content, not timestamps. The site is rebuilt
+          # from scratch on every run, so every local file looks new; without
+          # this flag each release would re-upload the entire repository.
+          common=(--checksum --transfers 8 --s3-chunk-size 64M
+                  --stats 30s --stats-one-line --retries 3)
+
+          # 1. Upload packages first, with `copy`, so nothing is ever removed
+          #    while an index that still references it is live.
+          echo "::group::Uploading packages"
+          rclone copy _site/deb/pool "r2:${R2_BUCKET}/deb/pool"   "${common[@]}"
+          rclone copy _site/rpm      "r2:${R2_BUCKET}/rpm"        "${common[@]}" --exclude '/repodata/**'
+          # `files/` only exists when RELEASES_BASE_URL is unset; normally the
+          # non-package assets are linked straight to the GitHub release.
+          if [ -d _site/files ]; then
+            rclone copy _site/files "r2:${R2_BUCKET}/files" "${common[@]}"
+          fi
+          echo "::endgroup::"
+
+          # 2. Then the freshly signed indexes. `--ignore-times` forces the
+          #    upload: these files are small and must never be stale.
+          echo "::group::Uploading indexes"
+          if [ -d _site/deb/dists ]; then
+            rclone sync _site/deb/dists "r2:${R2_BUCKET}/deb/dists" --ignore-times --retries 3
+          fi
+          if [ -d _site/rpm/repodata ]; then
+            rclone sync _site/rpm/repodata "r2:${R2_BUCKET}/rpm/repodata" --ignore-times --retries 3
+          fi
+          echo "::endgroup::"
+
+          # 3. Only now prune packages that no release carries any more.
+          echo "::group::Pruning withdrawn packages"
+          rclone sync _site/deb/pool "r2:${R2_BUCKET}/deb/pool" "${common[@]}"
+          rclone sync _site/rpm      "r2:${R2_BUCKET}/rpm"      "${common[@]}" --exclude '/repodata/**'
+          if [ -d _site/files ]; then
+            rclone sync _site/files "r2:${R2_BUCKET}/files" "${common[@]}"
+          fi
+          echo "::endgroup::"
+
+          # The heavy trees now live on R2; GitHub Pages keeps only the landing
+          # page, the public key and the client configuration files, which are a
+          # few kilobytes in total and stay well inside the 1 GB Pages limit.
+          rm -rf _site/deb _site/rpm _site/files
+          echo "Left for GitHub Pages: $(du -sh _site | cut -f1)"
 
       - name: Wipe signing material from the runner
         if: always()
