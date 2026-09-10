@@ -201,8 +201,11 @@ jobs:
           RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ACL: private
-          RCLONE_S3_NO_CHECK_BUCKET: "true"
+          # R2 buckets live in a single virtual region and are private by
+          # construction: it implements no S3 ACLs, so sending an `acl` value
+          # makes every upload fail with `501 Not Implemented`.
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
         run: |
           set -euo pipefail
 
