@@ -1,0 +1,194 @@
+name: Publish package repository
+
+# Rebuilds the whole APT/DNF repository from every published GitHub Release and
+# deploys it to GitHub Pages. The build is idempotent: it always starts from the
+# full set of release assets, so publishing, editing or deleting a release keeps
+# the repository consistent.
+
+on:
+  release:
+    types: [published, edited, released, deleted, unpublished]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why are you rebuilding? (free text, optional)"
+        required: false
+        default: "manual rebuild"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two deployments at once; let a newer build supersede a queued one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build signed repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install repository tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev apt-utils createrepo-c rpm gnupg xz-utils
+
+      - name: Download assets from every published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+
+          # Drafts have no public assets; skip them. Pre-releases are included so
+          # that beta packages are still installable.
+          tags=$(gh release list --limit 500 --json tagName,isDraft \
+                 --jq '.[] | select(.isDraft == false) | .tagName')
+
+          if [ -z "$tags" ]; then
+            echo "No published releases found — the site will be built empty."
+            exit 0
+          fi
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "::group::Downloading assets for $tag"
+            mkdir -p "assets/$tag"
+            # `|| true` keeps releases without matching assets from failing the run.
+            gh release download "$tag" --dir "assets/$tag" --clobber \
+              --pattern '*' || echo "No downloadable assets for $tag"
+            echo "::endgroup::"
+          done <<< "$tags"
+
+          find assets -type f | sort
+
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::error::Secret GPG_PRIVATE_KEY is missing. See manual_operations.md."
+            exit 1
+          fi
+
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+
+          # The passphrase, when present, is written to a 0600 file inside the
+          # ephemeral runner workspace so that gpg and rpmsign can both read it
+          # without it ever appearing in a command line or in the logs.
+          pass_file="${RUNNER_TEMP}/gpg-passphrase"
+          : > "$pass_file"
+          chmod 600 "$pass_file"
+          if [ -n "${GPG_PASSPHRASE:-}" ]; then
+            printf '%s' "$GPG_PASSPHRASE" > "$pass_file"
+          fi
+
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --yes --import
+
+          key_id=$(gpg --list-secret-keys --with-colons \
+                   | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ -z "$key_id" ]; then
+            echo "::error::No secret key found after import. Is GPG_PRIVATE_KEY a full ASCII-armored private key?"
+            exit 1
+          fi
+          echo "Imported key $key_id"
+
+          # Mark the key ultimately trusted so that rpmsign/createrepo do not stall.
+          printf '%s:6:\n' "$key_id" | gpg --batch --import-ownertrust
+
+          {
+            echo "GNUPGHOME=$GNUPGHOME"
+            echo "GPG_KEY_ID=$key_id"
+            echo "GPG_PASSPHRASE_FILE=$pass_file"
+          } >> "$GITHUB_ENV"
+
+      - name: Compute public base URL
+        id: site
+        env:
+          SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          owner="${SLUG%%/*}"
+          repo="${SLUG#*/}"
+          owner_lc=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+          repo_lc=$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]')
+
+          # A repository literally named <owner>.github.io is served from the
+          # domain root; every other repository is served from a subpath that
+          # keeps the repository name's original casing.
+          if [ "$repo_lc" = "${owner_lc}.github.io" ]; then
+            url="https://${owner_lc}.github.io"
+          else
+            url="https://${owner_lc}.github.io/${repo}"
+          fi
+
+          {
+            echo "url=$url"
+            echo "name=$repo"
+          } >> "$GITHUB_OUTPUT"
+          echo "Base URL: $url"
+
+      - name: Build signed APT + DNF repository
+        env:
+          ASSETS_DIR: assets
+          SITE_DIR: _site
+          BASE_URL: ${{ steps.site.outputs.url }}
+          REPO_NAME: ${{ steps.site.outputs.name }}
+          APT_SUITE: stable
+          APT_COMPONENT: main
+        run: ./scripts/build-repo.sh
+
+      - name: Verify signatures
+        run: |
+          set -euo pipefail
+
+          if [ -f _site/deb/dists/stable/InRelease ]; then
+            gpg --verify _site/deb/dists/stable/InRelease
+            gpg --verify _site/deb/dists/stable/Release.gpg _site/deb/dists/stable/Release
+            echo "APT signatures: OK"
+          fi
+
+          if compgen -G "_site/rpm/*.rpm" > /dev/null; then
+            gpg --verify _site/rpm/repodata/repomd.xml.asc _site/rpm/repodata/repomd.xml
+            # Importing the public key into the system rpmdb makes `rpm -K`
+            # verify the signature against it instead of reporting NOKEY.
+            sudo rpm --import _site/public-key.asc
+            for f in _site/rpm/*.rpm; do
+              sudo rpm -K "$f"
+            done
+            echo "RPM signatures: OK"
+          fi
+
+      - name: Wipe signing material from the runner
+        if: always()
+        run: |
+          GNUPGHOME="${RUNNER_TEMP}/gnupg" gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+          rm -rf "${RUNNER_TEMP}/gnupg" "${RUNNER_TEMP}/gpg-passphrase" || true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
