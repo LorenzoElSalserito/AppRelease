@@ -37,7 +37,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dpkg-dev apt-utils createrepo-c rpm gnupg xz-utils rclone
+            dpkg-dev apt-utils createrepo-c rpm gnupg xz-utils
 
       - name: Download assets from every published release
         env:
@@ -194,56 +194,53 @@ jobs:
       - name: Publish packages to Cloudflare R2
         env:
           R2_BUCKET: ${{ vars.R2_BUCKET }}
-          # rclone reads its whole configuration from these variables, so no
-          # credentials are ever written to a config file on the runner.
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          # R2 buckets live in a single virtual region and are private by
-          # construction: it implements no S3 ACLs, so sending an `acl` value
-          # makes every upload fail with `501 Not Implemented`.
-          RCLONE_CONFIG_R2_REGION: auto
-          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          # R2 exposes a single virtual region.
+          AWS_DEFAULT_REGION: auto
+          # Recent AWS CLI releases attach trailer checksums to every upload by
+          # default; several S3-compatible services reject them. Asking for them
+          # only where the operation requires them keeps R2 happy.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_supported
         run: |
           set -euo pipefail
+          aws --version
 
-          # `--checksum` compares content, not timestamps. The site is rebuilt
-          # from scratch on every run, so every local file looks new; without
-          # this flag each release would re-upload the entire repository.
-          common=(--checksum --transfers 8 --s3-chunk-size 64M
-                  --stats 30s --stats-one-line --retries 3)
+          s3="s3://${R2_BUCKET}"
+          ep=(--endpoint-url "$R2_ENDPOINT" --no-progress)
 
-          # 1. Upload packages first, with `copy`, so nothing is ever removed
-          #    while an index that still references it is live.
+          # 1. Packages first, so no published index ever points at a file that
+          #    is not there yet. `--size-only` is what keeps this cheap: the site
+          #    is rebuilt from scratch every run, so comparing timestamps would
+          #    re-upload gigabytes each time. Package filenames carry their
+          #    version, so a same-name same-size object is the same package.
           echo "::group::Uploading packages"
-          rclone copy _site/deb/pool "r2:${R2_BUCKET}/deb/pool"   "${common[@]}"
-          rclone copy _site/rpm      "r2:${R2_BUCKET}/rpm"        "${common[@]}" --exclude '/repodata/**'
-          # `files/` only exists when RELEASES_BASE_URL is unset; normally the
-          # non-package assets are linked straight to the GitHub release.
+          aws s3 sync _site/deb/pool "$s3/deb/pool" --size-only "${ep[@]}"
+          aws s3 sync _site/rpm      "$s3/rpm"      --size-only "${ep[@]}" --exclude 'repodata/*'
           if [ -d _site/files ]; then
-            rclone copy _site/files "r2:${R2_BUCKET}/files" "${common[@]}"
+            aws s3 sync _site/files "$s3/files" --size-only "${ep[@]}"
           fi
           echo "::endgroup::"
 
-          # 2. Then the freshly signed indexes. `--ignore-times` forces the
-          #    upload: these files are small and must never be stale.
+          # 2. Then the freshly signed indexes. These are compared by timestamp,
+          #    so they are re-uploaded on every run: they must never be stale.
           echo "::group::Uploading indexes"
           if [ -d _site/deb/dists ]; then
-            rclone sync _site/deb/dists "r2:${R2_BUCKET}/deb/dists" --ignore-times --retries 3
+            aws s3 sync _site/deb/dists "$s3/deb/dists" --delete "${ep[@]}"
           fi
           if [ -d _site/rpm/repodata ]; then
-            rclone sync _site/rpm/repodata "r2:${R2_BUCKET}/rpm/repodata" --ignore-times --retries 3
+            aws s3 sync _site/rpm/repodata "$s3/rpm/repodata" --delete "${ep[@]}"
           fi
           echo "::endgroup::"
 
-          # 3. Only now prune packages that no release carries any more.
+          # 3. Only now drop packages that no published release carries any more.
           echo "::group::Pruning withdrawn packages"
-          rclone sync _site/deb/pool "r2:${R2_BUCKET}/deb/pool" "${common[@]}"
-          rclone sync _site/rpm      "r2:${R2_BUCKET}/rpm"      "${common[@]}" --exclude '/repodata/**'
+          aws s3 sync _site/deb/pool "$s3/deb/pool" --size-only --delete "${ep[@]}"
+          aws s3 sync _site/rpm      "$s3/rpm"      --size-only --delete "${ep[@]}" --exclude 'repodata/*'
           if [ -d _site/files ]; then
-            rclone sync _site/files "r2:${R2_BUCKET}/files" "${common[@]}"
+            aws s3 sync _site/files "$s3/files" --size-only --delete "${ep[@]}"
           fi
           echo "::endgroup::"
 
