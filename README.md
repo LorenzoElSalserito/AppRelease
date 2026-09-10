@@ -1,5 +1,5 @@
 # AppRelease
-
+![Icon.png](Icon.png)
 **English** · [🇮🇹 Leggi in italiano](#italiano) · [🇮🇹 Vai subito ai comandi di installazione](#agganciare-il-repository)
 
 A GPG-signed Linux package repository. Hook it up once and my applications
