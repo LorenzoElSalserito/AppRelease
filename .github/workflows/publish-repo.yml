@@ -14,6 +14,11 @@ on:
         description: "Why are you rebuilding? (free text, optional)"
         required: false
         default: "manual rebuild"
+      force_upload:
+        description: "Re-upload every package even if name and size are unchanged. Needed after a signing key change: re-signing an RPM leaves its size identical, so the usual comparison would skip it."
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -204,6 +209,7 @@ jobs:
           # only where the operation requires them keeps R2 happy.
           AWS_REQUEST_CHECKSUM_CALCULATION: when_required
           AWS_RESPONSE_CHECKSUM_VALIDATION: when_supported
+          FORCE_UPLOAD: ${{ inputs.force_upload }}
         run: |
           set -euo pipefail
           aws --version
@@ -211,16 +217,28 @@ jobs:
           s3="s3://${R2_BUCKET}"
           ep=(--endpoint-url "$R2_ENDPOINT" --no-progress)
 
+          # Packages are normally compared by name and size, which is what keeps
+          # a rebuild from re-sending gigabytes. Re-signing an RPM leaves its
+          # size untouched, though, so after a key change that comparison would
+          # skip precisely the files that must be replaced. Dropping the flag
+          # falls back to comparing timestamps, and the freshly built copies are
+          # always newer.
+          cmp=(--size-only)
+          if [ "${FORCE_UPLOAD:-false}" = "true" ]; then
+            cmp=()
+            echo "force_upload requested: every package will be re-uploaded"
+          fi
+
           # 1. Packages first, so no published index ever points at a file that
           #    is not there yet. `--size-only` is what keeps this cheap: the site
           #    is rebuilt from scratch every run, so comparing timestamps would
           #    re-upload gigabytes each time. Package filenames carry their
           #    version, so a same-name same-size object is the same package.
           echo "::group::Uploading packages"
-          aws s3 sync _site/deb/pool "$s3/deb/pool" --size-only "${ep[@]}"
-          aws s3 sync _site/rpm      "$s3/rpm"      --size-only "${ep[@]}" --exclude 'repodata/*'
+          aws s3 sync _site/deb/pool "$s3/deb/pool" "${cmp[@]}" "${ep[@]}"
+          aws s3 sync _site/rpm      "$s3/rpm"      "${cmp[@]}" "${ep[@]}" --exclude 'repodata/*'
           if [ -d _site/files ]; then
-            aws s3 sync _site/files "$s3/files" --size-only "${ep[@]}"
+            aws s3 sync _site/files "$s3/files" "${cmp[@]}" "${ep[@]}"
           fi
           echo "::endgroup::"
 
@@ -237,10 +255,10 @@ jobs:
 
           # 3. Only now drop packages that no published release carries any more.
           echo "::group::Pruning withdrawn packages"
-          aws s3 sync _site/deb/pool "$s3/deb/pool" --size-only --delete "${ep[@]}"
-          aws s3 sync _site/rpm      "$s3/rpm"      --size-only --delete "${ep[@]}" --exclude 'repodata/*'
+          aws s3 sync _site/deb/pool "$s3/deb/pool" "${cmp[@]}" --delete "${ep[@]}"
+          aws s3 sync _site/rpm      "$s3/rpm"      "${cmp[@]}" --delete "${ep[@]}" --exclude 'repodata/*'
           if [ -d _site/files ]; then
-            aws s3 sync _site/files "$s3/files" --size-only --delete "${ep[@]}"
+            aws s3 sync _site/files "$s3/files" "${cmp[@]}" --delete "${ep[@]}"
           fi
           echo "::endgroup::"
 
